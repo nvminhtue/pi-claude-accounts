@@ -1,0 +1,29 @@
+{
+  "name": "pi-claude-accounts",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Pi extension: keep several Claude Pro/Max OAuth logins and switch between them with /account",
+  "keywords": ["pi-package", "pi", "claude", "anthropic", "oauth"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test \"test/*.test.mjs\"",
+    "check": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.99.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
