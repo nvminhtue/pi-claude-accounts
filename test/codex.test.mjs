@@ -3,8 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import {
-	codexRows,
+// Set isolated paths before the strict auth reader loads through Codex.
+const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-accounts-codex-agent-"));
+process.env.PI_CODING_AGENT_DIR = agentDir;
+process.env.HOME = mkdtempSync(join(tmpdir(), "pi-multi-accounts-codex-home-"));
+globalThis.fetch = () => { throw new Error("network disabled in tests"); };
+const {
+	createCodexProvider,
 	credFromFile,
 	credFromTokens,
 	discoverHomes,
@@ -13,7 +18,7 @@ import {
 	registerCodex,
 	shouldAdopt,
 	writeBack,
-} from "../src/codex.ts";
+} = await import("../src/codex.ts");
 
 const jwt = (c) => ["e30", Buffer.from(JSON.stringify(c)).toString("base64url"), "sig"].join(".");
 const AUTH_CLAIM = "https://api.openai.com/auth";
@@ -210,12 +215,58 @@ test("registerCodex wires login, refresh and getApiKey to the auth file", async 
 	assert.equal(existsSync(`${home.authPath}.${process.pid}.tmp`), false);
 });
 
-test("codexRows reports login state per home", () => {
-	const root = tmp();
+test("Codex entries retain provider identity, login state, active state and paths with spaces", () => {
+	const root = join(tmp(), "path with spaces");
 	const huy = homeFor(root, "huy");
 	const bob = homeFor(root, "bob");
-	const rows = codexRows([huy, bob], { "openai-codex-huy": { type: "oauth" }, "openai-codex-bob": { type: "api_key" } });
-	assert.equal(rows[0], `  huy  openai-codex-huy  ${huy.authPath}  logged in`);
-	assert.equal(rows[1], `  bob  openai-codex-bob  ${bob.authPath}  not logged in (/login → "OpenAI Codex (bob)")`);
-	assert.deepEqual(codexRows([], {}), []);
+	writeAuthFile(agentDir, { "openai-codex-huy": { type: "oauth" }, "openai-codex-bob": { type: "api_key" } });
+	const adapter = createCodexProvider({}, [huy, bob]);
+	assert.deepEqual(adapter.getEntries({ model: { provider: "openai-codex-huy" } }), [
+		{ provider: "codex", id: "openai-codex-huy", name: "huy", authPath: huy.authPath, isLoggedIn: true, isActive: true },
+		{ provider: "codex", id: "openai-codex-bob", name: "bob", authPath: bob.authPath, isLoggedIn: false, isActive: false },
+	]);
+	assert.deepEqual(createCodexProvider({}, []).getEntries({}), []);
+});
+
+test("Codex status uses the strict auth reader without rewriting corrupt auth", () => {
+	const path = writeAuthFile(agentDir, "{ corrupt auth SECRET");
+	const adapter = createCodexProvider({}, [homeFor(tmp())]);
+	assert.throws(() => adapter.getEntries({}), /not valid JSON/);
+	assert.equal(readFileSync(path, "utf8"), "{ corrupt auth SECRET");
+});
+
+test("Codex adapter rejects an ID outside its snapshot before reading model APIs", async () => {
+	const adapter = createCodexProvider({ setModel: () => { throw new Error("must not set a model"); } }, [homeFor(tmp())]);
+	const notices = [];
+	await adapter.useAccount("openai-codex-missing", { ui: { notify: (message, level) => notices.push({ message, level }) } });
+	assert.equal(notices.length, 1);
+	assert.equal(notices[0].level, "error");
+	assert.match(notices[0].message, /Unknown Codex provider/);
+});
+
+test("Codex adapter preserves a same-ID target model without UI or fallback discovery", async () => {
+	const home = homeFor(tmp());
+	const target = { provider: "openai-codex-huy", id: "shared", name: "Shared" };
+	const notices = [];
+	const calls = [];
+	const ctx = {
+		hasUI: false,
+		model: { provider: "anthropic", id: "shared" },
+		modelRegistry: {
+			find: (provider, id) => {
+				assert.equal(provider, "openai-codex-huy");
+				assert.equal(id, "shared");
+				return target;
+			},
+			getAll: () => { throw new Error("no fallback required"); },
+			hasConfiguredAuth: (model) => { assert.equal(model, target); return true; },
+		},
+		ui: { notify: (message, level) => notices.push({ message, level }) },
+	};
+	const adapter = createCodexProvider({ setModel: async (model) => { calls.push(model); ctx.model = model; return true; } }, [home]);
+	await adapter.useAccount("openai-codex-huy", ctx);
+	assert.deepEqual(calls, [target]);
+	assert.equal(ctx.model, target);
+	assert.equal(notices.length, 1);
+	assert.match(notices[0].message, /Switched this session to openai-codex-huy\/shared/);
 });

@@ -18,10 +18,12 @@
  * keep sharing one valid login.
  */
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderModelConfig, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readAuth } from "./claude.ts";
+import type { CodexEntry } from "./accounts.ts";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -56,10 +58,14 @@ export interface CodexHome {
 	authPath: string;
 }
 
-function jwtClaims(token: string): Record<string, any> {
+function jwtClaims(token: string): Record<string, unknown> {
 	const payload = token.split(".")[1];
 	if (!payload) throw new Error("access token is not a JWT");
-	return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+	try {
+		return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+	} catch {
+		throw new Error("Failed to parse JWT payload");
+	}
 }
 
 function readAuthFile(path: string): CodexAuthFile {
@@ -73,8 +79,11 @@ function readAuthFile(path: string): CodexAuthFile {
 }
 
 export function credFromTokens(access: string, refresh: string): CodexCred {
-	const claims = jwtClaims(access);
-	const accountId = claims[JWT_AUTH_CLAIM]?.chatgpt_account_id;
+	const claims = jwtClaims(access) as Record<string, unknown>;
+	const authClaim = claims[JWT_AUTH_CLAIM];
+	const accountId = typeof authClaim === "object" && authClaim !== null
+		? (authClaim as Record<string, unknown>).chatgpt_account_id
+		: undefined;
 	if (typeof accountId !== "string" || !accountId) throw new Error("access token has no chatgpt_account_id");
 	if (typeof claims.exp !== "number") throw new Error("access token has no exp claim");
 	return { access, refresh, expires: claims.exp * 1000, accountId };
@@ -186,12 +195,63 @@ export function registerCodex(pi: ExtensionAPI, homes = discoverHomes()): CodexH
 	return homes;
 }
 
-/** Status lines for `/account list`: one per Codex home, by login state in Pi's auth.json. */
-export function codexRows(homes: CodexHome[], auth: Record<string, unknown>): string[] {
-	return homes.map((home) => {
-		const id = `openai-codex-${home.name}`;
-		const entry = auth[id] as { type?: unknown } | undefined;
-		const state = entry?.type === "oauth" ? "logged in" : `not logged in (/login → "OpenAI Codex (${home.name})")`;
-		return `  ${home.name}  ${id}  ${home.authPath}  ${state}`;
-	});
+/** One adapter per registration snapshot; later homes require /reload. */
+export function createCodexProvider(pi: ExtensionAPI, homes: readonly CodexHome[]) {
+	const registeredHomes = [...homes];
+	const getProviderId = (home: CodexHome) => `openai-codex-${home.name}`;
+	const getIds = () => registeredHomes.map(getProviderId);
+
+	function getEntries(ctx: ExtensionContext): CodexEntry[] {
+		const auth = readAuth();
+		return registeredHomes.map((home) => {
+			const id = getProviderId(home);
+			const credential = auth[id] as { type?: unknown } | undefined;
+			return {
+				provider: "codex",
+				id,
+				name: home.name,
+				authPath: home.authPath,
+				isLoggedIn: credential?.type === "oauth",
+				isActive: ctx.model?.provider === id,
+			};
+		});
+	}
+
+	function notifyLogin(id: string, ctx: ExtensionContext): void {
+		const home = registeredHomes.find((home) => getProviderId(home) === id);
+		ctx.ui.notify(`No configured auth for ${id}. Run /login → "OpenAI Codex (${home?.name})" first.`, "error");
+	}
+
+	async function chooseModel(id: string, ctx: ExtensionContext) {
+		const models = ctx.modelRegistry.getAll().filter((model) => model.provider === id);
+		if (!models.length) {
+			ctx.ui.notify(`No registered models for ${id}. Run /reload.`, "error");
+			return;
+		}
+		const available = models.filter((model) => ctx.modelRegistry.hasConfiguredAuth(model));
+		if (!available.length) return notifyLogin(id, ctx);
+		if (!ctx.hasUI) {
+			ctx.ui.notify(`Choose a model for ${id} explicitly with /model.`, "warning");
+			return;
+		}
+		const labels = available.map((model) => `${model.name} (${model.id})`);
+		const choice = await ctx.ui.select(`Choose a model for ${id}`, labels);
+		return available.find((_model, index) => labels[index] === choice);
+	}
+
+	async function useAccount(id: string, ctx: ExtensionContext): Promise<void> {
+		if (!getIds().includes(id)) {
+			ctx.ui.notify(`Unknown Codex provider "${id}". Run /reload after adding a home.`, "error");
+			return;
+		}
+		const sameModel = ctx.model ? ctx.modelRegistry.find(id, ctx.model.id) : undefined;
+		const model = sameModel ?? await chooseModel(id, ctx);
+		if (!model) return;
+		if (!ctx.modelRegistry.hasConfiguredAuth(model)) return notifyLogin(id, ctx);
+		const hasChanged = await pi.setModel(model);
+		if (!hasChanged) return notifyLogin(id, ctx);
+		ctx.ui.notify(`Switched this session to ${id}/${model.id}.`, "info");
+	}
+
+	return { getIds, getEntries, useAccount };
 }
