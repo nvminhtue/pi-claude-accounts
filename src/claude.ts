@@ -25,7 +25,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { codexRows, type CodexHome } from "./codex.ts";
+import type { ClaudeEntry, ClaudeStatus } from "./accounts.ts";
 
 const PROVIDER = "anthropic";
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -36,8 +36,7 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_TIMEOUT_MS = 20_000; // a Pi token refresh can hold the lock ~15 s
 const PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const STATUS_KEY = "claude-account";
-let codexHomes: CodexHome[] = [];
-const SUBCOMMANDS = ["save", "add", "list", "ls", "remove", "rm", "use", "switch", "help"];
+export const SUBCOMMANDS = ["save", "add", "list", "ls", "remove", "rm", "use", "switch", "help"];
 
 interface OAuthCred {
 	type: "oauth";
@@ -94,7 +93,7 @@ function isOAuth(c: unknown): c is OAuthCred {
 	return !!o && o.type === "oauth" && typeof o.refresh === "string" && typeof o.access === "string";
 }
 
-function readAuth(): Record<string, unknown> {
+export function readAuth(): Record<string, unknown> {
 	return readJsonStrict<Record<string, unknown>>(AUTH_PATH) ?? {};
 }
 
@@ -245,7 +244,15 @@ function updateStatus(ctx: ExtensionContext, result: SyncResult): void {
 	ctx.ui.setStatus(STATUS_KEY, text);
 }
 
-// ---------- commands ----------
+// ---------- Claude adapter ----------
+
+export const ClaudeProvider = {
+	getStatus: overview,
+	getSavedNames: () => Object.keys(loadStore().accounts),
+	useAccount: cmdUse,
+	saveAccount: cmdSave,
+	removeAccount: cmdRemove,
+};
 
 async function cmdSave(name: string, ctx: ExtensionContext): Promise<void> {
 	if (!/^[\w.-]+$/.test(name) || SUBCOMMANDS.includes(name)) {
@@ -285,7 +292,6 @@ async function cmdSave(name: string, ctx: ExtensionContext): Promise<void> {
 }
 
 async function cmdUse(name: string, ctx: ExtensionContext): Promise<void> {
-	if (!name) return cmdPick(ctx);
 	const known = loadStore().accounts[name];
 	if (!known) {
 		ctx.ui.notify(`Unknown account "${name}". Saved: ${Object.keys(loadStore().accounts).join(", ") || "(none)"}`, "error");
@@ -354,101 +360,23 @@ async function cmdRemove(name: string, ctx: ExtensionContext): Promise<void> {
 	updateStatus(ctx, await sync());
 }
 
-async function overview(ctx: ExtensionContext) {
+async function overview(ctx: ExtensionContext): Promise<ClaudeStatus> {
 	const result = await sync();
 	updateStatus(ctx, result);
 	const store = loadStore();
 	const active = result.kind === "matched" ? result.name : undefined;
-	const names = Object.keys(store.accounts);
-	const rows = names.map((n) => `${n === active ? "●" : "○"} ${label(n, store.accounts[n])}`);
-	return { result, names, rows };
+	const entries: ClaudeEntry[] = Object.keys(store.accounts).map((name) => ({
+		provider: "claude",
+		id: name,
+		name,
+		email: store.accounts[name].email,
+		isActive: name === active,
+	}));
+	const unsavedLogin = result.kind === "unknown" ? { email: result.profile?.email } : undefined;
+	return { entries, unsavedLogin };
 }
 
-async function cmdList(ctx: ExtensionContext): Promise<void> {
-	const { result, rows } = await overview(ctx);
-	if (result.kind === "unknown") {
-		const who = result.profile?.email ? ` (${result.profile.email})` : "";
-		rows.push(`! unsaved login in auth.json${who} — /account save <name>`);
-	}
-	const claude = rows.length ? rows.join("\n") : "No saved accounts. Run /login, then /account save <name>.";
-	if (codexHomes.length === 0) return ctx.ui.notify(claude, "info");
-	const codex = [
-		"Codex providers (parallel; pick a model with /model; /account does not switch these):",
-		...codexRows(codexHomes, readAuth()),
-	];
-	ctx.ui.notify(["Claude accounts (switch with /account <name>):", claude, "", ...codex].join("\n"), "info");
-}
-
-async function cmdPick(ctx: ExtensionContext): Promise<void> {
-	if (!ctx.hasUI) return cmdList(ctx);
-	const { names, rows } = await overview(ctx);
-	if (!names.length) return cmdList(ctx);
-	const choice = await ctx.ui.select("Switch Claude account", rows);
-	if (!choice) return;
-	await cmdUse(names[rows.indexOf(choice)], ctx);
-}
-
-const HELP = [
-	"/account                 pick a Claude account to switch to",
-	"/account <name>          switch to a saved Claude account",
-	"/account save <name>     save the current Anthropic /login under <name>",
-	"/account list            list saved Claude accounts and Codex providers",
-	"/account remove <name>   forget a saved Claude account",
-	"Switch, save and remove work on Claude accounts only.",
-	"Codex: each ~/.codex-<name>/auth.json is the provider openai-codex-<name>;",
-	'/login "OpenAI Codex (<name>)" once, then pick its model with /model.',
-].join("\n");
-
-export function registerClaude(pi: ExtensionAPI, homes: CodexHome[]): void {
-	codexHomes = homes;
-	pi.registerCommand("account", {
-		description: "Switch saved Claude accounts; list also shows Codex providers — /account help",
-		getArgumentCompletions: (prefix) => {
-			let names: string[] = [];
-			try {
-				names = Object.keys(loadStore().accounts);
-			} catch {
-				/* corrupt store: no name completions */
-			}
-			const [first] = prefix.split(/\s+/);
-			const withName = ["remove", "rm", "use", "switch"];
-			const pool =
-				prefix.includes(" ") && withName.includes(first)
-					? names.map((n) => `${first} ${n}`)
-					: [...names, "save", "list", "remove", "use", "help"];
-			const items = pool.filter((v) => v.startsWith(prefix)).map((v) => ({ value: v, label: v }));
-			return items.length ? items : null;
-		},
-		handler: async (args, ctx) => {
-			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
-			const arg = rest.join(" ");
-			try {
-				switch (sub) {
-					case undefined:
-						return await cmdPick(ctx);
-					case "save":
-					case "add":
-						return await cmdSave(arg, ctx);
-					case "list":
-					case "ls":
-						return await cmdList(ctx);
-					case "remove":
-					case "rm":
-						return await cmdRemove(arg, ctx);
-					case "use":
-					case "switch":
-						return await cmdUse(arg, ctx);
-					case "help":
-						return ctx.ui.notify(HELP, "info");
-					default:
-						return await cmdUse(sub, ctx);
-				}
-			} catch (err) {
-				ctx.ui.notify(`account: ${(err as Error).message}`, "error");
-			}
-		},
-	});
-
+export function registerClaude(pi: ExtensionAPI): void {
 	const quietSync = async (ctx: ExtensionContext, announce: boolean) => {
 		try {
 			const result = await sync();
