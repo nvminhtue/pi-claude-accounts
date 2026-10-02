@@ -1,11 +1,15 @@
 {
   "name": "pi-multi-accounts",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "type": "module",
   "description": "Pi extension: switch between several Claude Pro/Max OAuth logins with /account, and use extra ChatGPT (Codex) logins as parallel openai-codex-<name> providers",
   "keywords": ["pi-package", "pi", "claude", "anthropic", "openai", "codex", "chatgpt", "oauth", "multi-account"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nvminhtue/pi-multi-accounts.git"
+  },
   "pi": {
     "extensions": ["./src/index.ts"]
   },
