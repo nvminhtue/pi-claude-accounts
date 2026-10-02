@@ -1,12 +1,26 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { before, test } from "node:test";
 
 // The extension reads PI_CODING_AGENT_DIR at module load: set it before importing.
-const dir = mkdtempSync(join(tmpdir(), "pi-claude-accounts-"));
+const dir = mkdtempSync(join(tmpdir(), "pi-multi-accounts-"));
 process.env.PI_CODING_AGENT_DIR = dir;
+// Codex homes are discovered under $HOME: point it at a temp dir with one fake ~/.codex-team.
+const home = mkdtempSync(join(tmpdir(), "pi-multi-accounts-home-"));
+process.env.HOME = home;
+const jwt = (c) => ["e30", Buffer.from(JSON.stringify(c)).toString("base64url"), "sig"].join(".");
+mkdirSync(join(home, ".codex-team"));
+writeFileSync(
+	join(home, ".codex-team", "auth.json"),
+	JSON.stringify({
+		tokens: {
+			access_token: jwt({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: "acct-team" } }),
+			refresh_token: "codex-refresh",
+		},
+	}),
+);
 // Never hit the network: profile lookup must fail and return undefined.
 globalThis.fetch = () => Promise.reject(new Error("network disabled in tests"));
 
@@ -20,8 +34,10 @@ const writeAuth = (anthropic) =>
 
 const commands = new Map();
 const events = new Map();
+const providers = new Map();
 const pi = {
 	registerCommand: (name, def) => commands.set(name, def),
+	registerProvider: (name, def) => providers.set(name, def),
 	on: (event, handler) => events.set(event, handler),
 };
 
@@ -57,6 +73,11 @@ test("registers the account command and lifecycle hooks", () => {
 	assert.ok(commands.has("account"));
 	assert.ok(events.has("session_start"));
 	assert.ok(events.has("agent_end"));
+});
+
+test("registers the Codex home as a parallel provider", () => {
+	assert.deepEqual([...providers.keys()], ["openai-codex-team"]);
+	assert.equal(providers.get("openai-codex-team").api, "openai-codex-responses");
 });
 
 test("save stores the current login and marks it active", async () => {
@@ -154,6 +175,41 @@ test("store file is private and no lock or temp files are left behind", () => {
 	assert.equal(existsSync(`${AUTH}.lock`), false);
 	const leftovers = readdirSync(dir).filter((f) => f.endsWith(".tmp") || f.endsWith(".lock"));
 	assert.deepEqual(leftovers, []);
+});
+
+test("list shows Codex providers: not logged in, then logged in", async () => {
+	resetUi();
+	await account("list");
+	const before = lastNotice().message;
+	assert.match(before, /^Claude accounts \(switch with \/account <name>\):/);
+	assert.match(before, /Codex providers \(parallel; pick a model with \/model; \/account does not switch these\):/);
+	assert.match(before, /openai-codex-team .*auth\.json {2}not logged in \(\/login → "OpenAI Codex \(team\)"\)/);
+
+	resetUi();
+	const auth = readJson(AUTH);
+	auth["openai-codex-team"] = { type: "oauth", refresh: "r", access: "a", expires: Date.now() + 3_600_000 };
+	writeFileSync(AUTH, JSON.stringify(auth));
+	await account("list");
+	assert.match(lastNotice().message, /openai-codex-team .*auth\.json {2}logged in$/);
+});
+
+test("the picker offers Claude accounts only", async () => {
+	resetUi();
+	let rows = [];
+	selectImpl = async (_title, options) => {
+		rows = options;
+		return undefined;
+	};
+	await account("");
+	assert.ok(rows.length > 0);
+	assert.ok(rows.every((r) => !r.includes("codex") && !r.includes("Codex")));
+});
+
+test("help says switching is Claude-only", async () => {
+	resetUi();
+	await account("help");
+	assert.match(lastNotice().message, /Switch, save and remove work on Claude accounts only\./);
+	assert.match(lastNotice().message, /openai-codex-<name>/);
 });
 
 test("a corrupt store is reported and left unchanged", async () => {
