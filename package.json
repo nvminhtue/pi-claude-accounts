@@ -1,10 +1,10 @@
 {
-  "name": "pi-claude-accounts",
-  "version": "0.1.1",
+  "name": "pi-multi-accounts",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
-  "description": "Pi extension: keep several Claude Pro/Max OAuth logins and switch between them with /account",
-  "keywords": ["pi-package", "pi", "claude", "anthropic", "oauth"],
+  "description": "Pi extension: switch between several Claude Pro/Max OAuth logins with /account, and use extra ChatGPT (Codex) logins as parallel openai-codex-<name> providers",
+  "keywords": ["pi-package", "pi", "claude", "anthropic", "openai", "codex", "chatgpt", "oauth", "multi-account"],
   "license": "MIT",
   "pi": {
     "extensions": ["./src/index.ts"]
@@ -22,9 +22,11 @@
     "node": ">=22"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.99.2",
     "@earendil-works/pi-coding-agent": "0.99.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
